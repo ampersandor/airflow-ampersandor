@@ -18,21 +18,31 @@ from plugins import slack
 def _create_table(cur, schema, table, drop_first):
     if drop_first:
         cur.execute(f"DROP TABLE IF EXISTS {schema}.{table};")
+    location_table = """
+        CREATE TABLE IF NOT EXISTS {schema}.{officetel_location}} (
+            location_id SERIAL PRIMARY KEY,
+            city VARCHAR(30),
+            sggnm VARCHAR(30),
+            umdnm VARCHAR(30),
+            UNIQUE(city, ku, dong)
+        );
+    """
     query = f"""
         CREATE TABLE IF NOT EXISTS {schema}.{table} (
-            upload_date DATE DEFAULT CURRENT_DATE,
-            upload_time TIME DEFAULT CURRENT_TIME,
+            id SERIAL PRIMARY KEY,
+            created_at DATE DEFAULT CURRENT_DATE,
+            location_id INT REFERENCES {schema}.{officetel_location}(location_id),
             trade_ymd DATE,
             city VARCHAR(30),
-            ku VARCHAR(30),
-            dong VARCHAR(30),
-            jicode VARCHAR(30),
-            name VARCHAR(30),
+            sggNm VARCHAR(30),
+            umdNm VARCHAR(30),
+            jibun VARCHAR(30),
+            offiNm VARCHAR(30),
             floor INT,
-            area FLOAT,
+            excluUseAr FLOAT,
             built_year INT,
             deposite INT,
-            monthly_pay INT
+            monthlyrent INT
         );
     """
     logging.info(query)
@@ -41,7 +51,7 @@ def _create_table(cur, schema, table, drop_first):
 
 @contextmanager
 def get_postgres_connection():
-    connection = PostgresHook(postgres_conn_id="odigodi_postgres").get_conn()
+    connection = PostgresHook(postgres_conn_id="odigodi-supabase").get_conn()
     try:
         yield connection
     finally:
@@ -54,9 +64,10 @@ def extract_officetel_rent_data(url, key, loc):
     date = context["logical_date"]
     logging.info(date)
     ym = date.strftime("%Y%m")
-    api = f"{url}?serviceKey={key}&LAWD_CD={loc}&DEAL_YMD={ym}"
+    api = f"{url}?LAWD_CD={loc}&DEAL_YMD={ym}&serviceKey={key}"
     try:
         response = requests.get(api)
+        print(f"API Response Status Code: {response.status_code}")
         response.raise_for_status()
     except requests.exceptions.RequestException as e:  # This is the correct syntax
         logging.warning(f"while requesting to {api}...")
@@ -71,68 +82,53 @@ def transform_officetel_rent_data(city, data):
     context = get_current_context()
     date = context["logical_date"]
     year, month, day = date.strftime("%Y %m %d").split()
-    res = list()
     tree = ET.ElementTree(ET.fromstring(data))
     root = tree.getroot()
+    rows = []
     for item in root.findall(".//item"):
-        trade_year = item.find("년").text.strip() if item.find("년") is not None else year
-        trade_month = (
-            item.find("월").text.strip() if item.find("월") is not None else month
-        )
-        trade_day = item.find("일").text.strip() if item.find("일") is not None else day
-        trade_ymd = f"{trade_year}-{trade_month}-{trade_day}"
+        
+        keys = ["dealYear", "dealMonth", "dealDay", "sggNm", "umdNm", "jibun", "offiNm", "floor", "excluUseAr", "deposit", "monthlyRent"]
+        row = {k: item.find(k).text.replace(",", "").strip() if item.find(k) is not None else "NULL" for k in keys}
 
-        ku = item.find("시군구").text.strip() if item.find("시군구") is not None else "NULL"
-        dong = item.find("법정동").text.strip() if item.find("법정동") is not None else "NULL"
-        jicode = item.find("지번").text.strip() if item.find("지번") is not None else "NULL"
-        name = item.find("단지").text.strip() if item.find("단지") is not None else "NULL"
-        floor = item.find("층").text.strip() if item.find("층") is not None else "NULL"
-        area = (
-            item.find("전용면적").text.strip() if item.find("전용면적") is not None else "NULL"
-        )
-        built_year = (
-            item.find("건축년도").text.strip() if item.find("건축년도") is not None else "NULL"
-        )
-        deposite = (
-            item.find("보증금").text.strip().replace(",", "")
-            if item.find("보증금") is not None
-            else "NULL"
-        )
-        monthly_pay = (
-            item.find("월세").text.strip().replace(",", "")
-            if item.find("월세") is not None
-            else "NULL"
-        )
-        res.append(
-            (
-                trade_ymd,
-                city,
-                ku,
-                dong,
-                jicode,
-                name,
-                floor,
-                area,
-                built_year,
-                deposite,
-                monthly_pay,
-            )
-        )
+        trade_ymd = f"{row['dealYear']}-{row['dealMonth']}-{row['dealDay']}"
+        row["trade_ymd"] = trade_ymd
+        row["city"] = city
+        row.pop("dealYear")
+        row.pop("dealMonth")
+        row.pop("dealDay")
+        rows.append(row)
 
-    return res
+    return rows
 
 
 @task
-def load_officetel_rent_data(schema, table, data, drop_first=False):
+def load_officetel_rent_data(schema, table, rows, drop_first=False):
+    
     with get_postgres_connection() as connection:
         cur = connection.cursor()
         _create_table(cur, schema, table, drop_first)
         try:
             cur.execute("BEGIN;")
-            for row in data:
+            for row in rows:
+                location_query = f"""
+                    WITH ins AS (
+                        INSERT INTO {schema}.{officetel_location} (city, sggNm, umdNm, jibun, offiNm)
+                        VALUES ({", ".join(map(lambda x: f"'{x}'", [row[k] for k in ["city", "sggNm", "umdNm", "jibun", "offiNm"]]))})
+                        ON CONFLICT (city, sggNm, umdNm, jibun, offiNm) DO NOTHING
+                        RETURNING id
+                    )
+                    SELECT id FROM ins
+                    UNION ALL
+                    SELECT id FROM {schema}.{officetel_location}
+                    WHERE city = '{row["city"]}' AND sggNm = '{row["sggNm"]}' AND umdNm = '{row["umdNm"]}' AND jibun = '{row["jibun"]}' AND offiNm = '{row["offiNm"]}'
+                    LIMIT 1;
+                """
+                cur.execute(location_query)
+                location_id = cur.fetchone()[0]
+                row["location_id"] = location_id
                 query = f"""
-                    INSERT INTO {schema}.{table} (trade_ymd, city, ku, dong, jicode, name, floor, area, built_year, deposite, monthly_pay)
-                    VALUES ('{row[0]}', '{row[1]}', '{row[2]}', '{row[3]}', '{row[4]}', '{row[5]}', {row[6]}, {row[7]}, {row[8]}, {row[9]}, {row[10]})
+                    INSERT INTO {schema}.{table} ({", ".join(cols)})
+                    VALUES ({", ".join(map(lambda x: f"'{x}'", [row[k] for k in cols]))})
                 """
                 logging.info(query)
                 cur.execute(query)
@@ -148,15 +144,23 @@ dong_code = {
     "서울특별시 송파구": "11710",
     "서울특별시 강서구": "11500",
     "서울특별시 강남구": "11680",
-    "인천광역시 미추홀구": "28177",
+    "인천시 미추홀구"  : "28177",
 }
-# https://www.code.go.kr/stdcode/regCodeL.do
 
+translate = {"서울특별시 송파구" : "Seoul_Songpa",
+            "서울특별시 강서구" : "Seoul_Gangseo",
+            "서울특별시 강남구": "Seoul_Gangnam",
+            "인천시 미추홀구": "Incheon_Michuhol"}
+
+cols =  ["trade_ymd", "city","sggNm", "umdNm", "jibun", "offiNm", "floor", "excluUseAr", "deposit", "monthlyRent", "location_id"]
+officetel_location = "officetel_location"
+schema = "public"
+table = "officetel_rent"
 h = 0
 for address, code in dong_code.items():
     h += 1
     with DAG(
-        dag_id=f"officetel_rent_{code}",
+        dag_id=f"officetel_rent_{translate[address]}",
         start_date=datetime(2021, 1, 1),
         schedule=f"0 {h} 1 * *",  # every month (day 1, 00:00)
         max_active_runs=1,
@@ -169,10 +173,9 @@ for address, code in dong_code.items():
             "on_success_callback": slack.on_success_callback,
         },
     ) as dag:
-        schema = "officetel"
-        table = "rent"
-        url = Variable.get("data_portal_url_rent")
-        key = Variable.get("data_portal_api_key")
+
+        url = Variable.get("data_portal_url_rent").strip()
+        key = Variable.get("data_portal_api_key").strip()
 
         city, ku = address.split()
         load_officetel_rent_data(
